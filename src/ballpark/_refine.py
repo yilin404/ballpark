@@ -1,771 +1,468 @@
-"""Robot-level sphere refinement with jaxls nonlinear least squares optimization."""
+"""Independent per-link Warp/SDF collision-sphere refinement."""
 
 from __future__ import annotations
 
-from typing import Callable
+import math
+from typing import Optional
 
 import numpy as np
+import torch
+import torch.nn.functional as torch_functional
 import trimesh
-import jax
-import jax.numpy as jnp
-import jax_dataclasses as jdc
-import jaxlie
-import jaxls
 from loguru import logger
 
-from ._spherize import Sphere
 from ._config import RefineParams
+from ._metrics import sample_mesh_coverage_points, sample_sphere_directions
+from ._spherize import Sphere
+from ._warp_mesh_query import WarpMeshQuery, WarpSignedDistance
 
 
-# =============================================================================
-# Helper functions
-# =============================================================================
+ClipPlane = tuple[str, float]
+_CLIP_AXIS_NORMALS: dict[str, tuple[float, float, float]] = {
+    "x": (1.0, 0.0, 0.0),
+    "y": (0.0, 1.0, 0.0),
+    "z": (0.0, 0.0, 1.0),
+}
+_REFINE_COVERAGE_SAMPLE_SEED = 43
 
 
-def _transform_point(center: jax.Array, transform: jax.Array) -> jax.Array:
-    """Transform a point from link frame to world frame.
-
-    Args:
-        center: (3,) point in link frame
-        transform: (7,) array [qw, qx, qy, qz, x, y, z]
-
-    Returns:
-        (3,) point in world frame
-    """
-    wxyz = transform[:4]
-    xyz = transform[4:]
-    so3 = jaxlie.SO3(wxyz=wxyz)
-    return so3 @ center + xyz
-
-
-# =============================================================================
-# jaxls Variable Type
-# =============================================================================
-
-
-class SphereVar(
-    jaxls.Var[Sphere],
-    default_factory=lambda: Sphere(center=jnp.zeros(3), radius=jnp.array(0.01)),
-):
-    """Variable type for sphere parameters (center + radius)."""
-
-    pass
-
-
-# =============================================================================
-# Internal dataclasses
-# =============================================================================
-
-
-@jdc.pytree_dataclass
-class _FlattenedSphereData:
-    """Flattened sphere and point data for JIT-compatible optimization.
-
-    JAX's JIT compiler requires static array shapes at compile time. Per-link
-    dictionaries with variable-length lists cannot be traced. We "flatten"
-    per-link data into contiguous arrays with index mappings.
-    """
-
-    # Batched spheres
-    spheres: Sphere  # center: (N, 3), radius: (N,)
-
-    # Point data
-    points_all: jnp.ndarray  # (P, 3) all surface points concatenated
-
-    # Index mappings for per-link operations
-    sphere_to_link: jnp.ndarray  # (N,) int32 - which link each sphere belongs to
-    point_to_link: jnp.ndarray  # (P,) int32 - which link each point belongs to
-
-    # FK transforms for self-collision
-    sphere_transforms: jnp.ndarray  # (N, 7) FK transform (wxyz+xyz) per sphere
-
-    # Metadata (static - not traced by JAX)
-    link_sphere_ranges: jdc.Static[tuple[tuple[int, int], ...]]
-    link_point_ranges: jdc.Static[tuple[tuple[int, int], ...]]
-    link_names: jdc.Static[tuple[str, ...]]
-    n_spheres: jdc.Static[int]
-    n_links: jdc.Static[int]
-    scale: float
-
-
-# =============================================================================
-# Flattening utilities (internal)
-# =============================================================================
-
-
-def _build_flattened_sphere_data(
-    link_spheres: dict[str, list[Sphere]],
-    link_points: dict[str, np.ndarray],
-    link_names: list[str],
-    Ts: np.ndarray,
-    link_name_to_idx: dict[str, int],
-) -> _FlattenedSphereData | None:
-    """Flatten per-link sphere/point dicts into arrays for JAX optimization.
+def _resolve_clip_axis(axis: str) -> np.ndarray:
+    """Convert a cuRobo-style clip axis into a unit normal.
 
     Args:
-        link_spheres: Dict mapping link names to lists of Sphere objects.
-        link_points: Dict mapping link names to surface point arrays.
-        link_names: Ordered list of link names with spheres.
-        Ts: FK transforms for all links, shape (num_all_links, 7).
-        link_name_to_idx: Maps link name to index in Ts.
+        axis: Axis string ``x``, ``y``, ``z`` or its negated form.
 
     Returns:
-        Flattened data or None if no spheres.
+        Link-local unit normal with shape ``(3,)``.
+
+    Raises:
+        ValueError: If the axis is unsupported.
     """
-    all_centers: list[np.ndarray] = []
-    all_radii: list[np.ndarray] = []
-    all_points: list[np.ndarray] = []
-    link_sphere_ranges: list[tuple[int, int]] = []
-    link_point_ranges: list[tuple[int, int]] = []
+    normalized_axis = axis.lower()
+    positive_axis = normalized_axis.removeprefix("-")
+    if positive_axis not in _CLIP_AXIS_NORMALS or normalized_axis.count("-") > 1:
+        raise ValueError(f"Invalid clip axis '{axis}', expected x, y, z, -x, -y, or -z")
+    normal = np.asarray(_CLIP_AXIS_NORMALS[positive_axis], dtype=np.float32)
+    return -normal if normalized_axis.startswith("-") else normal
 
-    sphere_idx = 0
-    point_idx = 0
 
-    for link_name in link_names:
-        spheres = link_spheres[link_name]
-        points = link_points.get(link_name, np.zeros((0, 3)))
+def _inverse_softplus(values: torch.Tensor) -> torch.Tensor:
+    """Map positive radii to unconstrained softplus parameters.
 
-        start_sphere = sphere_idx
-        for s in spheres:
-            all_centers.append(np.asarray(s.center))
-            all_radii.append(np.asarray(s.radius))
-            sphere_idx += 1
-        link_sphere_ranges.append((start_sphere, sphere_idx))
+    Args:
+        values: Strictly positive radius offsets.
 
-        start_point = point_idx
-        if len(points) > 0:
-            all_points.append(points)
-            point_idx += len(points)
-        link_point_ranges.append((start_point, point_idx))
+    Returns:
+        Unconstrained parameters satisfying ``softplus(result) == values`` up
+        to floating-point precision.
+    """
+    return values + torch.log(-torch.expm1(-values))
 
-    if not all_centers:
-        return None
 
-    n_spheres = len(all_centers)
-    n_links = len(link_names)
+def _coverage_loss(
+    coverage_points: torch.Tensor,
+    centers: torch.Tensor,
+    radii: torch.Tensor,
+    mesh_extent: float,
+) -> torch.Tensor:
+    """Penalize original mesh volume samples outside every sphere.
 
-    centers = jnp.array(all_centers)
-    radii = jnp.array(all_radii)
-    points_all = jnp.array(np.vstack(all_points) if all_points else np.zeros((1, 3)))
+    Args:
+        coverage_points: Fixed link-local interior samples of shape ``(M, 3)``;
+            non-watertight meshes use surface samples as a fallback.
+        centers: Optimized sphere centers of shape ``(N, 3)``.
+        radii: Positive sphere radii of shape ``(N,)``.
+        mesh_extent: Positive link bounding-box diagonal in meters.
 
-    # Create batched Sphere objects
-    spheres = Sphere(center=centers, radius=radii)
+    Returns:
+        Scale-normalized squared coverage loss.
+    """
+    signed_gaps = torch.cdist(coverage_points, centers) - radii.unsqueeze(0)
+    temperature = mesh_extent * 0.01
+    soft_minimum = -temperature * torch.logsumexp(
+        -signed_gaps / temperature,
+        dim=1,
+    )
+    return torch.mean(torch.relu(soft_minimum) ** 2) / (mesh_extent**2)
 
-    sphere_to_link_list: list[int] = []
-    for i, link_name in enumerate(link_names):
-        n_in_link = len(link_spheres[link_name])
-        sphere_to_link_list.extend([i] * n_in_link)
-    sphere_to_link = jnp.array(sphere_to_link_list, dtype=jnp.int32)
 
-    point_to_link_list: list[int] = []
-    for i, link_name in enumerate(link_names):
-        points = link_points.get(link_name, np.zeros((0, 3)))
-        point_to_link_list.extend([i] * len(points))
-    if point_to_link_list:
-        point_to_link = jnp.array(point_to_link_list, dtype=jnp.int32)
-    else:
-        point_to_link = jnp.zeros((1,), dtype=jnp.int32)
+def _protrusion_reduction(
+    signed_distance: torch.Tensor,
+    mesh_extent: float,
+) -> torch.Tensor:
+    """Apply cuRobo's per-sphere max and cross-sphere soft-max reduction.
 
-    if len(all_points) > 0:
-        points_stacked = np.vstack(all_points)
-        bbox_diag = np.linalg.norm(
-            points_stacked.max(axis=0) - points_stacked.min(axis=0)
-        )
-    else:
-        bbox_diag = np.linalg.norm(
-            np.array(all_centers).max(axis=0) - np.array(all_centers).min(axis=0)
-        )
-    scale = float(bbox_diag + 1e-8)
+    Args:
+        signed_distance: Mesh signed distances for sphere surface samples with
+            shape ``(N, K)`` in meters; positive values are outside the mesh.
+        mesh_extent: Positive link bounding-box diagonal in meters.
 
-    # Build sphere transforms (assign each sphere its link's FK transform)
-    sphere_transforms_list: list[np.ndarray] = []
-    for link_name in link_names:
-        transform_idx = link_name_to_idx[link_name]
-        T = Ts[transform_idx]
-        n_in_link = len(link_spheres[link_name])
-        sphere_transforms_list.extend([T] * n_in_link)
-    sphere_transforms = jnp.array(sphere_transforms_list)
+    Returns:
+        Scale-normalized MorphIt protrusion loss.
+    """
+    squared_outside_distance = torch.relu(signed_distance) ** 2
+    per_sphere_maximum = squared_outside_distance.max(dim=1).values
+    temperature = mesh_extent * 0.01
+    soft_maximum = temperature * torch.logsumexp(
+        per_sphere_maximum / temperature,
+        dim=0,
+    )
+    return soft_maximum / (mesh_extent**2)
 
-    return _FlattenedSphereData(
-        spheres=spheres,
-        points_all=points_all,
-        sphere_to_link=sphere_to_link,
-        point_to_link=point_to_link,
-        sphere_transforms=sphere_transforms,
-        link_sphere_ranges=tuple(link_sphere_ranges),
-        link_point_ranges=tuple(link_point_ranges),
-        link_names=tuple(link_names),
-        n_spheres=n_spheres,
-        n_links=n_links,
-        scale=scale,
+
+def _protrusion_loss(
+    centers: torch.Tensor,
+    radii: torch.Tensor,
+    directions: torch.Tensor,
+    mesh_query: WarpMeshQuery,
+    mesh_extent: float,
+) -> torch.Tensor:
+    """Query sphere boundaries and compute cuRobo v2 protrusion.
+
+    Args:
+        centers: Optimized sphere centers of shape ``(N, 3)``.
+        radii: Positive sphere radii of shape ``(N,)``.
+        directions: Fixed unit directions of shape ``(K, 3)``.
+        mesh_query: Differentiable Warp query for the original link mesh.
+        mesh_extent: Positive link bounding-box diagonal in meters.
+
+    Returns:
+        Scale-normalized MorphIt protrusion loss.
+    """
+    sphere_surface = centers[:, None, :] + radii[:, None, None] * directions[None, :, :]
+    signed_distance = WarpSignedDistance.apply(
+        sphere_surface.reshape(-1, 3),
+        mesh_query,
+    ).reshape(centers.shape[0], -1)
+    return _protrusion_reduction(signed_distance, mesh_extent)
+
+
+def _tangency_reduction(
+    center_signed_distance: torch.Tensor,
+    radii: torch.Tensor,
+    mesh_extent: float,
+) -> torch.Tensor:
+    """Apply cuRobo's sphere-center tangency reduction.
+
+    Args:
+        center_signed_distance: Mesh SDF at sphere centers with shape ``(N,)``.
+        radii: Positive sphere radii with shape ``(N,)``.
+        mesh_extent: Positive link bounding-box diagonal in meters.
+
+    Returns:
+        Scale-normalized mean squared internal boundary gap.
+    """
+    boundary_gap = torch.abs(center_signed_distance) - radii
+    return torch.mean(torch.relu(boundary_gap) ** 2) / (mesh_extent**2)
+
+
+def _tangency_loss(
+    centers: torch.Tensor,
+    radii: torch.Tensor,
+    mesh_query: WarpMeshQuery,
+    mesh_extent: float,
+) -> torch.Tensor:
+    """Query sphere centers and compute cuRobo v2 tangency.
+
+    Args:
+        centers: Optimized sphere centers of shape ``(N, 3)``.
+        radii: Positive sphere radii of shape ``(N,)``.
+        mesh_query: Differentiable Warp query for the original link mesh.
+        mesh_extent: Positive link bounding-box diagonal in meters.
+
+    Returns:
+        Scale-normalized MorphIt tangency loss.
+    """
+    center_signed_distance = WarpSignedDistance.apply(centers, mesh_query)
+    return _tangency_reduction(
+        center_signed_distance,
+        radii,
+        mesh_extent,
     )
 
 
-def _unflatten_to_link_spheres(
-    centers: np.ndarray,
-    radii: np.ndarray,
-    link_names: list[str],
-    link_sphere_ranges: list[tuple[int, int]],
-    original_link_spheres: dict[str, list[Sphere]],
-) -> dict[str, list[Sphere]]:
-    """Convert flattened arrays back to per-link Sphere dictionaries."""
-    refined_link_spheres = {}
-
-    for i, link_name in enumerate(link_names):
-        start, end = link_sphere_ranges[i]
-        refined_link_spheres[link_name] = [
-            Sphere(center=centers[j], radius=radii[j]) for j in range(start, end)
-        ]
-
-    for link_name, spheres in original_link_spheres.items():
-        if link_name not in refined_link_spheres:
-            refined_link_spheres[link_name] = spheres
-
-    return refined_link_spheres
-
-
-# =============================================================================
-# jaxls Cost Functions
-# =============================================================================
-
-
-@jaxls.Cost.factory
-def _under_approx_cost(
-    vals: jaxls.VarValues,
-    sphere_vars: tuple[SphereVar, ...],
-    points: jax.Array,
-    sphere_mask: jax.Array,
-    point_mask: jax.Array,
-    lambda_under: float,
-) -> jax.Array:
-    """Vectorized under-approximation: penalize points outside ALL spheres.
-
-    Uses fixed-size inputs with masking to enable single JIT compilation
-    regardless of actual sphere/point counts per link.
+def _overlap_loss(
+    centers: torch.Tensor,
+    radii: torch.Tensor,
+    mesh_extent: float,
+) -> torch.Tensor:
+    """Reproduce cuRobo v2's full-matrix overlap reduction.
 
     Args:
-        vals: Variable values from optimizer
-        sphere_vars: Tuple of sphere variables (fixed length, padded)
-        points: Surface points (fixed shape, padded), shape (max_P, 3)
-        sphere_mask: Boolean mask for valid spheres, shape (max_S,)
-        point_mask: Boolean mask for valid points, shape (max_P,)
-        lambda_under: Weight for under-approximation penalty
+        centers: Optimized sphere centers of shape ``(N, 3)``.
+        radii: Positive sphere radii of shape ``(N,)``.
+        mesh_extent: Positive link bounding-box diagonal in meters.
 
     Returns:
-        Residual vector of shape (max_P,), masked for invalid points
+        Mean pairwise penetration over the full symmetric matrix, normalized
+        by link extent. Diagonal elements are masked as in cuRobo v2.
     """
-    # Stack sphere centers and radii (tuple length is static, loop unrolls)
-    centers = jnp.stack([vals[sv].center for sv in sphere_vars])  # (S, 3)
-    radii = jnp.stack([vals[sv].radius for sv in sphere_vars])  # (S,)
-
-    # Broadcast: points (P, 1, 3) - centers (1, S, 3) -> diff (P, S, 3)
-    diff = points[:, None, :] - centers[None, :, :]
-    dists = jnp.sqrt(jnp.sum(diff**2, axis=-1) + 1e-8)  # (P, S)
-    signed_dists = dists - radii[None, :]  # (P, S)
-
-    # Mask invalid spheres (set to +inf so they don't affect min)
-    signed_dists = jnp.where(sphere_mask[None, :], signed_dists, jnp.inf)
-
-    # Min over spheres: point is covered if inside ANY sphere
-    min_signed_dist = jnp.min(signed_dists, axis=1)  # (P,)
-
-    # Compute residuals, zeroing out invalid points
-    residuals = jnp.sqrt(lambda_under) * jnp.maximum(0.0, min_signed_dist)
-    return jnp.where(point_mask, residuals, 0.0)
+    sphere_count = centers.shape[0]
+    pairwise_distance = torch.cdist(centers, centers)
+    pairwise_distance = (
+        pairwise_distance
+        + torch.eye(
+            sphere_count,
+            dtype=centers.dtype,
+            device=centers.device,
+        )
+        * 1e6
+    )
+    radius_sum = radii.unsqueeze(1) + radii.unsqueeze(0)
+    return torch.mean(torch.relu(radius_sum - pairwise_distance)) / mesh_extent
 
 
-@jaxls.Cost.factory
-def _over_approx_cost(
-    vals: jaxls.VarValues,
-    sphere_var: SphereVar,
-    scale: float,
-    lambda_over: float,
-) -> jax.Array:
-    """Over-approximation cost: penalize large sphere volumes."""
-    sphere = vals[sphere_var]
-    radius = jnp.maximum(sphere.radius, 1e-4)
-    # Residual proportional to radius^1.5 (volume^0.5)
-    return jnp.sqrt(lambda_over) * (radius / scale) ** 1.5
-
-
-@jaxls.Cost.factory
-def _center_reg_cost(
-    vals: jaxls.VarValues,
-    sphere_var: SphereVar,
-    init_center: jax.Array,
-    scale: float,
-    lambda_center_reg: float,
-) -> jax.Array:
-    """Center regularization: penalize deviation from initial center position.
+def _halfplane_loss(
+    centers: torch.Tensor,
+    radii: torch.Tensor,
+    plane_normal: torch.Tensor,
+    plane_offset: float,
+    buffer: float = 0.02,
+) -> torch.Tensor:
+    """Penalize sphere boundaries crossing a link-local half-space plane.
 
     Args:
-        vals: Variable values from optimizer
-        sphere_var: Sphere variable
-        init_center: Initial center position, shape (3,)
-        scale: Scale factor for normalization
-        lambda_center_reg: Weight for regularization
+        centers: Optimized sphere centers of shape ``(N, 3)``.
+        radii: Positive sphere radii of shape ``(N,)``.
+        plane_normal: Unit normal pointing into the allowed half-space.
+        plane_offset: Plane offset in link-local meters.
+        buffer: Required clearance from the sphere boundary in meters.
 
     Returns:
-        Residual vector of shape (3,), one per coordinate
+        Mean absolute-meter squared half-plane penetration loss.
     """
-    sphere = vals[sphere_var]
-    return jnp.sqrt(lambda_center_reg) * (sphere.center - init_center) / scale
+    signed_distance = centers @ plane_normal - plane_offset
+    clearance = signed_distance - radii - buffer
+    return torch.mean(torch.relu(-clearance) ** 2)
 
 
-@jaxls.Cost.factory
-def _radius_reg_cost(
-    vals: jaxls.VarValues,
-    sphere_var: SphereVar,
-    init_radius: jax.Array,
-    scale: float,
-    lambda_radius_reg: float,
-) -> jax.Array:
-    """Radius regularization: penalize deviation from initial radius.
-
-    Args:
-        vals: Variable values from optimizer
-        sphere_var: Sphere variable
-        init_radius: Initial radius value
-        scale: Scale factor for normalization
-        lambda_radius_reg: Weight for regularization
-
-    Returns:
-        Scalar residual
-    """
-    sphere = vals[sphere_var]
-    return jnp.sqrt(lambda_radius_reg) * (sphere.radius - init_radius) / scale
-
-
-@jaxls.Cost.factory
-def _self_collision_cost(
-    vals: jaxls.VarValues,
-    sphere_var_i: SphereVar,
-    sphere_var_j: SphereVar,
-    transform_i: jax.Array,
-    transform_j: jax.Array,
-    lambda_self_collision: float,
-) -> jax.Array:
-    """Self-collision cost for a pair of spheres from non-contiguous links.
-
-    Penalizes penetration (negative signed distance) between spheres.
-
-    Args:
-        vals: Variable values from optimizer
-        sphere_var_i: First sphere variable
-        sphere_var_j: Second sphere variable
-        transform_i: FK transform for first sphere's link, (7,) wxyz+xyz
-        transform_j: FK transform for second sphere's link, (7,) wxyz+xyz
-        lambda_self_collision: Weight for self-collision penalty
-
-    Returns:
-        Scalar residual (sqrt(lambda) * penetration_depth)
-    """
-    sphere_i = vals[sphere_var_i]
-    sphere_j = vals[sphere_var_j]
-
-    # Transform centers to world frame
-    center_i_world = _transform_point(sphere_i.center, transform_i)
-    center_j_world = _transform_point(sphere_j.center, transform_j)
-
-    # Compute signed distance (negative = penetration)
-    dist = jnp.sqrt(jnp.sum((center_i_world - center_j_world) ** 2) + 1e-8)
-    sum_radii = sphere_i.radius + sphere_j.radius
-    signed_dist = dist - sum_radii
-
-    # Penalize penetration only: max(0, -signed_dist)
-    penetration = jnp.maximum(0.0, -signed_dist)
-    return jnp.sqrt(lambda_self_collision) * penetration
-
-
-def _build_collision_pairs(
-    link_names: list[str],
-    link_sphere_ranges: list[tuple[int, int]],
-    non_contiguous_pairs: list[tuple[str, str]],
-    excluded_pairs: set[tuple[str, str]] | None = None,
-) -> tuple[list[tuple[int, int]], list[tuple[str, str]]]:
-    """Build list of sphere index pairs to check for self-collision.
-
-    Args:
-        link_names: Ordered list of link names with spheres.
-        link_sphere_ranges: (start, end) sphere indices for each link.
-        non_contiguous_pairs: Link pairs that are not adjacent in kinematic chain.
-        excluded_pairs: Link pairs to skip (user-disabled).
-
-    Returns:
-        Tuple of (sphere_pairs, valid_link_pairs) where:
-        - sphere_pairs: List of (sphere_idx_i, sphere_idx_j) to check
-        - valid_link_pairs: Link pairs that passed filtering (for logging)
-    """
-    link_name_to_internal_idx = {name: i for i, name in enumerate(link_names)}
-
-    sphere_pairs: list[tuple[int, int]] = []
-    valid_link_pairs: list[tuple[str, str]] = []
-
-    for link_a, link_b in non_contiguous_pairs:
-        # Skip user-excluded pairs
-        if excluded_pairs:
-            if (link_a, link_b) in excluded_pairs or (link_b, link_a) in excluded_pairs:
-                continue
-        # Skip if either link not in our optimization set
-        if link_a not in link_name_to_internal_idx:
-            continue
-        if link_b not in link_name_to_internal_idx:
-            continue
-
-        internal_idx_a = link_name_to_internal_idx[link_a]
-        internal_idx_b = link_name_to_internal_idx[link_b]
-        range_a = link_sphere_ranges[internal_idx_a]
-        range_b = link_sphere_ranges[internal_idx_b]
-
-        # Skip if either link has no spheres
-        if range_a[0] >= range_a[1] or range_b[0] >= range_b[1]:
-            continue
-
-        valid_link_pairs.append((link_a, link_b))
-
-        # Add all sphere pairs between these links
-        for i in range(range_a[0], range_a[1]):
-            for j in range(range_b[0], range_b[1]):
-                sphere_pairs.append((i, j))
-
-    return sphere_pairs, valid_link_pairs
-
-
-def _build_jaxls_costs(
-    data: _FlattenedSphereData,
+def refine_link_spheres(
+    mesh: trimesh.Trimesh,
+    initial_spheres: list[Sphere],
     params: RefineParams,
-    collision_pairs: list[tuple[int, int]],
-) -> list[jaxls.Cost]:
-    """Build optimization costs for sphere refinement.
+    clip_plane: Optional[ClipPlane] = None,
+    device: torch.device | None = None,
+) -> list[Sphere]:
+    """Refine one link's spheres against its original collision mesh.
 
-    Includes:
-    - Under-approximation: penalize points outside spheres
-    - Over-approximation: penalize large sphere volumes
-    - Center regularization: penalize deviation from initial positions
-    - Radius regularization: penalize deviation from initial radii
-    - Self-collision: penalize overlap between non-adjacent link spheres
-
-    Args:
-        data: Flattened sphere/point data
-        params: Refinement parameters
-        collision_pairs: List of (sphere_idx_i, sphere_idx_j) pairs to check
-
-    Returns:
-        List of jaxls.Cost objects
-    """
-    costs: list[jaxls.Cost] = []
-    n_spheres = data.n_spheres
-    sphere_vars = SphereVar(jnp.arange(n_spheres))
-
-    # Find max spheres and points per link for padding
-    max_spheres_per_link = max(
-        end - start for start, end in data.link_sphere_ranges
-    )
-    max_points_per_link = max(
-        end - start for start, end in data.link_point_ranges
-    )
-
-    # Under-approximation costs: one per link with padded fixed dimensions
-    for link_idx in range(data.n_links):
-        point_start, point_end = data.link_point_ranges[link_idx]
-        sphere_start, sphere_end = data.link_sphere_ranges[link_idx]
-
-        n_link_spheres = sphere_end - sphere_start
-        n_link_points = point_end - point_start
-
-        if n_link_points == 0 or n_link_spheres == 0:
-            continue
-
-        # Get link data
-        link_points = data.points_all[point_start:point_end]
-
-        # Pad points to max size
-        padded_points = jnp.pad(
-            link_points,
-            ((0, max_points_per_link - n_link_points), (0, 0)),
-        )
-
-        # Create padded sphere vars tuple (use SphereVar(0) as padding placeholder)
-        link_sphere_vars = tuple(
-            SphereVar(sphere_start + i) if i < n_link_spheres else SphereVar(0)
-            for i in range(max_spheres_per_link)
-        )
-
-        # Create masks
-        sphere_mask = jnp.arange(max_spheres_per_link) < n_link_spheres
-        point_mask = jnp.arange(max_points_per_link) < n_link_points
-
-        costs.append(
-            _under_approx_cost(
-                link_sphere_vars,
-                padded_points,
-                sphere_mask,
-                point_mask,
-                params.lambda_under,
-            )
-        )
-
-    # Over-approximation costs: penalize large sphere volumes
-    costs.append(
-        _over_approx_cost(
-            sphere_vars,
-            data.scale,
-            params.lambda_over,
-        )
-    )
-
-    # Center regularization: penalize deviation from initial positions
-    costs.append(
-        _center_reg_cost(
-            sphere_vars,
-            data.spheres.center,
-            data.scale,
-            params.lambda_center_reg,
-        )
-    )
-
-    # Radius regularization: penalize deviation from initial radii
-    costs.append(
-        _radius_reg_cost(
-            sphere_vars,
-            data.spheres.radius,
-            data.scale,
-            params.lambda_radius_reg,
-        )
-    )
-
-    # Self-collision costs: one per collision pair
-    # Note: The lambda_self_collision > 0 check is done before calling this function
-    # (in refine_robot_spheres) to avoid JIT tracing issues with the conditional
-    for i, j in collision_pairs:
-        costs.append(
-            _self_collision_cost(
-                SphereVar(i),
-                SphereVar(j),
-                data.sphere_transforms[i],
-                data.sphere_transforms[j],
-                params.lambda_self_collision,
-            )
-        )
-
-    return costs
-
-
-# =============================================================================
-# Optimization loop
-# =============================================================================
-
-
-@jdc.jit
-def _run_robot_optimization(
-    data: _FlattenedSphereData,
-    params: RefineParams,
-    n_iters: jdc.Static[int],
-    tol: float,
-    collision_pairs: jdc.Static[tuple[tuple[int, int], ...]],
-) -> tuple[Sphere, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Run the full optimization loop using jaxls nonlinear least squares.
+    The function uses fixed deterministic mesh/sphere samples, a differentiable
+    Warp SDF, and Torch AdamW. Coverage, protrusion, tangency, and overlap are
+    normalized by the link bounding-box diagonal for scale-consistent per-link
+    optimization. The optional half-plane Cost remains in absolute meters and
+    requests ``params.clip_plane_buffer`` clearance, which defaults to 0.02 m.
 
     Args:
-        data: Flattened sphere/point data with initial spheres
-        params: Refinement parameters
-        n_iters: Maximum number of optimization iterations
-        tol: Relative convergence tolerance for early stopping
-        collision_pairs: Static tuple of (sphere_idx_i, sphere_idx_j) pairs
+        mesh: Original link-local collision mesh in meters.
+        initial_spheres: Initial link-local spheres from ``Robot.spherize``.
+        params: Per-link optimization settings and cost weights.
+        clip_plane: Optional ``(axis, offset_m)`` allowed half-space in the
+            link-local frame. The soft Cost uses the configured absolute-meter
+            buffer.
+        device: Optional Torch device, defaulting to CUDA when available.
 
     Returns:
-        Tuple of (final_spheres, init_loss, final_loss, n_steps)
+        Refined link-local spheres in their original ordering.
+
+    Raises:
+        ValueError: If the mesh, spheres, parameters, or clip plane are invalid.
+        RuntimeError: If optimization produces a non-finite loss.
+
+    Note:
+        This function initializes and uses the Torch and Warp runtimes on the
+        selected device, executes the configured optimization, and emits an
+        informational log after optimization. Its final hard projection is
+        independent of all Cost weights: it moves each violating sphere until
+        the sphere boundary reaches the plane boundary, without preserving the
+        soft ``clip_plane_buffer`` clearance.
     """
-    n_spheres = data.n_spheres
+    if not initial_spheres:
+        return []
+    if params.n_iters < 0 or params.n_samples <= 0:
+        raise ValueError("refinement iteration and sample counts are invalid")
+    if (
+        params.center_lr < 0.0
+        or params.radius_lr < 0.0
+        or params.grad_clip_norm < 0.0
+    ):
+        raise ValueError("learning rates and gradient clip norm must be non-negative")
+    mesh_extent = float(np.linalg.norm(mesh.extents))
+    if not math.isfinite(mesh_extent) or mesh_extent <= 0.0:
+        raise ValueError("refinement mesh must have positive finite extent")
 
-    # Create sphere variables
-    sphere_vars = SphereVar(jnp.arange(n_spheres))
-
-    # Build costs
-    costs = _build_jaxls_costs(data, params, list(collision_pairs))
-
-    if not costs:
-        # No costs to optimize, return initial spheres
-        return data.spheres, jnp.array(0.0), jnp.array(0.0), jnp.array(0)
-
-    # Create initial values
-    initial_vals = jaxls.VarValues.make(
-        [
-            sphere_vars[i].with_value(
-                Sphere(
-                    center=data.spheres.center[i],
-                    radius=data.spheres.radius[i],
-                )
-            )
-            for i in range(n_spheres)
-        ]
+    torch_device = device or torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
     )
-
-    # Build and solve the problem
-    problem = jaxls.LeastSquaresProblem(costs=costs, variables=[sphere_vars])
-    analyzed = problem.analyze()
-
-    # Compute initial cost
-    init_residual = analyzed.compute_residual_vector(initial_vals)
-    init_loss = jnp.sum(init_residual**2)
-
-    # Solve
-    solution, summary = analyzed.solve(
-        initial_vals=initial_vals,
-        termination=jaxls.TerminationConfig(
-            max_iterations=n_iters,
-            cost_tolerance=tol,
+    initial_centers = torch.as_tensor(
+        np.stack(
+            [np.asarray(sphere.center, dtype=np.float32) for sphere in initial_spheres]
         ),
-        trust_region=jaxls.TrustRegionConfig(),
-        verbose=False,
-        return_summary=True,
+        dtype=torch.float32,
+        device=torch_device,
     )
+    initial_radii = torch.as_tensor(
+        [float(sphere.radius) for sphere in initial_spheres],
+        dtype=torch.float32,
+        device=torch_device,
+    )
+    if torch.any(initial_radii <= 0.0) or not torch.isfinite(initial_centers).all():
+        raise ValueError(
+            "initial spheres must contain finite centers and positive radii"
+        )
 
-    # Extract optimized spheres
-    centers_list = []
-    radii_list = []
-    for i in range(n_spheres):
-        sphere = solution[SphereVar(i)]
-        centers_list.append(sphere.center)
-        radii_list.append(sphere.radius)
-
-    final_centers = jnp.stack(centers_list)
-    final_radii = jnp.stack(radii_list)
-
-    # Clamp radii to minimum
-    final_radii = jnp.maximum(final_radii, params.min_radius)
-
-    final_spheres = Sphere(center=final_centers, radius=final_radii)
-
-    # Compute final cost
-    final_vals = jaxls.VarValues.make(
+    # AdamW updates dimensionless link-normalized variables so the configured
+    # learning rates have consistent geometric meaning across link scales.
+    initial_centers_normalized = initial_centers / mesh_extent
+    initial_radii_normalized = initial_radii / mesh_extent
+    minimum_radius_normalized = params.min_radius / mesh_extent
+    centers_normalized = torch.nn.Parameter(initial_centers_normalized.clone())
+    radius_offset = torch.clamp(
+        initial_radii_normalized - minimum_radius_normalized,
+        min=1e-6,
+    )
+    raw_radii = torch.nn.Parameter(_inverse_softplus(radius_offset))
+    optimizer = torch.optim.AdamW(
         [
-            sphere_vars[i].with_value(
-                Sphere(center=final_centers[i], radius=final_radii[i])
-            )
-            for i in range(n_spheres)
-        ]
+            {"params": [centers_normalized], "lr": params.center_lr},
+            {"params": [raw_radii], "lr": params.radius_lr},
+        ],
+        weight_decay=0.01,
     )
-    final_residual = analyzed.compute_residual_vector(final_vals)
-    final_loss = jnp.sum(final_residual**2)
 
-    return final_spheres, init_loss, final_loss, summary.iterations
+    # Precompute fixed mesh coverage and sphere-surface samples for every iteration.
+    mesh_query = WarpMeshQuery(mesh, torch_device)
+    coverage_points = sample_mesh_coverage_points(
+        mesh=mesh,
+        mesh_query=mesh_query,
+        count=params.n_samples,
+        device=torch_device,
+        seed=_REFINE_COVERAGE_SAMPLE_SEED,
+    )
+    directions = torch.as_tensor(
+        sample_sphere_directions(params.n_sphere_surface_samples),
+        dtype=torch.float32,
+        device=torch_device,
+    )
 
+    # Resolve the optional link-local clip plane once before optimization.
+    plane_normal: torch.Tensor | None = None
+    plane_offset = 0.0
+    if clip_plane is not None:
+        clip_axis, raw_plane_offset = clip_plane
+        plane_normal = torch.as_tensor(
+            _resolve_clip_axis(clip_axis), dtype=torch.float32, device=torch_device
+        )
+        plane_offset = float(raw_plane_offset)
+        if not math.isfinite(plane_offset):
+            raise ValueError("clip plane offset must be finite")
 
-# =============================================================================
-# Main entry point (called by Robot.refine)
-# =============================================================================
+    # Execute the exact configured iteration budget. Center and radius gradients
+    # are clipped independently because their parameter scales and rates differ.
+    final_loss_value = 0.0
+    for _ in range(params.n_iters):
+        optimizer.zero_grad(set_to_none=True)
+        centers = centers_normalized * mesh_extent
+        radii_normalized = (
+            torch_functional.softplus(raw_radii) + minimum_radius_normalized
+        )
+        radii = radii_normalized * mesh_extent
+        loss = (
+            params.lambda_coverage
+            * _coverage_loss(coverage_points, centers, radii, mesh_extent)
+            + params.lambda_protrusion
+            * _protrusion_loss(centers, radii, directions, mesh_query, mesh_extent)
+            + params.lambda_tangency
+            * _tangency_loss(centers, radii, mesh_query, mesh_extent)
+            + params.lambda_overlap * _overlap_loss(centers, radii, mesh_extent)
+        )
+        if plane_normal is not None:
+            loss = loss + params.lambda_clip_plane * _halfplane_loss(
+                centers,
+                radii,
+                plane_normal,
+                plane_offset,
+                buffer=params.clip_plane_buffer,
+            )
+        if not torch.isfinite(loss):
+            raise RuntimeError("non-finite per-link refinement loss")
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(
+            [centers_normalized],
+            max_norm=params.grad_clip_norm,
+        )
+        torch.nn.utils.clip_grad_norm_(
+            [raw_radii],
+            max_norm=params.grad_clip_norm,
+        )
+        optimizer.step()
+        final_loss_value = float(loss.detach())
+
+    final_centers = centers_normalized.detach() * mesh_extent
+    final_radii = (
+        torch_functional.softplus(raw_radii).detach() + minimum_radius_normalized
+    ) * mesh_extent
+
+    # Hard-project any residual clip-plane violations after the soft penalty converges.
+    if plane_normal is not None:
+        clearance = final_centers @ plane_normal - final_radii - plane_offset
+        violations = torch.relu(-clearance)
+        final_centers = final_centers + violations[:, None] * plane_normal[None, :]
+
+    logger.info(
+        "Refined link with {} spheres: loss {:.6g}",
+        len(initial_spheres),
+        final_loss_value,
+    )
+
+    # Convert detached tensors back to the public Sphere representation in input order.
+    centers_numpy = final_centers.cpu().numpy()
+    radii_numpy = final_radii.cpu().numpy()
+    return [
+        Sphere(center=centers_numpy[index], radius=np.asarray(radii_numpy[index]))
+        for index in range(len(initial_spheres))
+    ]
 
 
 def refine_robot_spheres(
     link_spheres: dict[str, list[Sphere]],
     link_meshes: dict[str, trimesh.Trimesh],
-    all_link_names: list[str],
-    joint_limits: tuple[np.ndarray, np.ndarray],
-    compute_transforms: Callable[[np.ndarray], np.ndarray],
-    non_contiguous_pairs: list[tuple[str, str]],
     refine_params: RefineParams | None = None,
-    joint_cfg: np.ndarray | None = None,
-    excluded_pairs: set[tuple[str, str]] | None = None,
+    clip_links: Optional[dict[str, ClipPlane]] = None,
 ) -> dict[str, list[Sphere]]:
-    """
-    Refine sphere parameters for all robot links jointly.
-
-    Uses under-approximation (spheres must cover mesh surface),
-    over-approximation (minimize sphere volumes), and self-collision
-    (penalize overlap between non-adjacent links) costs.
-
-    This is the internal entry point called by Robot.refine().
+    """Refine robot collision spheres independently for every link.
 
     Args:
-        link_spheres: Dict mapping link names to lists of Sphere objects.
-        link_meshes: Dict mapping link names to their collision meshes.
-        all_link_names: Ordered list of all link names.
-        joint_limits: Tuple of (lower_limits, upper_limits) arrays.
-        compute_transforms: Function that takes joint_cfg and returns (N, 7) transforms.
-        non_contiguous_pairs: List of (link_a, link_b) pairs that are not adjacent.
-        refine_params: Refinement parameters. If None, uses defaults.
-        joint_cfg: Joint configuration for FK computation. If None, uses middle of
-            joint limits.
-        excluded_pairs: Link pairs to skip for collision checking (user-disabled).
+        link_spheres: Initial link-local spheres keyed by link name.
+        link_meshes: Original link-local collision meshes keyed by link name.
+        refine_params: Optional per-link optimization parameters.
+        clip_links: Optional link-local clipping plane per named link.
 
     Returns:
-        Dict mapping link names to refined lists of Sphere objects
+        Refined spheres keyed by link name, preserving links without spheres.
+
+    Raises:
+        ValueError: If a clip link has no sphere-bearing collision mesh.
     """
-    p = refine_params or RefineParams()
-
-    # Get link names with spheres
-    link_names = [name for name in all_link_names if link_spheres.get(name)]
-    if not link_names:
-        return link_spheres
-
-    link_name_to_idx = {name: idx for idx, name in enumerate(all_link_names)}
-
-    # Compute FK at specified config or middle of joint limits
-    if joint_cfg is None:
-        lower, upper = joint_limits
-        joint_cfg = (lower + upper) / 2
-    Ts = compute_transforms(joint_cfg)
-
-    # Sample points for each link
-    link_points: dict[str, np.ndarray] = {}
-    for link_name in link_names:
-        mesh = link_meshes.get(link_name)
-        if mesh is not None and not mesh.is_empty:
-            link_points[link_name] = mesh.sample(p.n_samples)  # type: ignore[assignment]
-        else:
-            link_points[link_name] = np.zeros((0, 3))
-
-    # Build flattened data (with transforms)
-    flat_data = _build_flattened_sphere_data(
-        link_spheres, link_points, link_names, Ts, link_name_to_idx
+    params = refine_params or RefineParams()
+    clip_configuration = clip_links or {}
+    unknown_clip_links = set(clip_configuration).difference(
+        link_name for link_name, spheres in link_spheres.items() if spheres
     )
-
-    if flat_data is None:
-        return link_spheres
-
-    # Build collision pairs only if self-collision is enabled
-    # This check must be done here (not in JIT) to avoid tracing issues
-    collision_pairs: list[tuple[int, int]] = []
-    if p.lambda_self_collision > 0:
-        # Build collision pairs
-        collision_pairs, valid_link_pairs = _build_collision_pairs(
-            list(flat_data.link_names),
-            list(flat_data.link_sphere_ranges),
-            non_contiguous_pairs,
-            excluded_pairs,
+    if unknown_clip_links:
+        raise ValueError(
+            "Clip links do not contain collision spheres: "
+            + ", ".join(sorted(unknown_clip_links))
         )
 
-        if collision_pairs:
-            logger.info(
-                f"Self-collision: checking {len(collision_pairs)} sphere pairs "
-                f"across {len(valid_link_pairs)} link pairs"
-            )
-
-    # Run optimization
-    final_spheres, init_loss, final_loss, n_steps = _run_robot_optimization(
-        flat_data,
-        p,
-        p.n_iters,
-        p.tol,
-        tuple(collision_pairs),
-    )
-
-    logger.info(
-        f"Optimization: {int(n_steps)} iterations, "
-        f"loss {float(init_loss):.4f} -> {float(final_loss):.4f}"
-    )
-
-    # Unflatten results
-    centers_np = np.array(final_spheres.center)
-    radii_np = np.array(final_spheres.radius)
-
-    refined_link_spheres = _unflatten_to_link_spheres(
-        centers_np,
-        radii_np,
-        list(flat_data.link_names),
-        list(flat_data.link_sphere_ranges),
-        link_spheres,
-    )
-
-    return refined_link_spheres
+    refined: dict[str, list[Sphere]] = {}
+    for link_name, spheres in link_spheres.items():
+        mesh = link_meshes.get(link_name)
+        if not spheres or mesh is None or mesh.is_empty:
+            refined[link_name] = spheres
+            continue
+        refined[link_name] = refine_link_spheres(
+            mesh=mesh,
+            initial_spheres=spheres,
+            params=params,
+            clip_plane=clip_configuration.get(link_name),
+        )
+    return refined

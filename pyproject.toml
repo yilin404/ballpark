@@ -26,10 +26,11 @@ dependencies = [
     "jax_dataclasses",
     "jaxlib",
     "jaxlie",
-    "jaxls @ git+https://github.com/brentyi/jaxls.git",
-    "optax",
     "loguru",
+    "python-fcl",
+    "torch",
     "yourdfpy",
+    "warp-lang",
 ]
 
 [project.optional-dependencies]

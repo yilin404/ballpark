@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, Optional, Tuple
 
 import jaxlie
 import numpy as np
@@ -13,6 +14,12 @@ from scipy.spatial.transform import Rotation
 from loguru import logger
 
 from ._config import BallparkConfig, SpherePreset, SpherizeParams
+from ._fcl_collision import (
+    canonicalize_link_pair,
+    compute_configuration_collision_pairs,
+    compute_halton_ignore_pairs,
+)
+from ._metrics import SphereFitMetrics, compute_sphere_fit_metrics
 from ._spherize import Sphere, spherize
 from ._similarity import SimilarityResult, detect_similar_links
 from ._refine import refine_robot_spheres
@@ -21,9 +28,10 @@ from .utils._hash_geometry import get_link_collision_fingerprint
 
 @dataclass
 class RobotSpheresResult:
-    """Result from robot spherization."""
+    """Robot spheres and per-link metrics against original collision meshes."""
 
     link_spheres: dict[str, list[Sphere]]
+    link_metrics: dict[str, SphereFitMetrics] = field(default_factory=dict)
 
     @property
     def num_spheres(self) -> int:
@@ -120,6 +128,94 @@ class Robot:
         """Link pairs that are not adjacent in the kinematic chain."""
         return self._non_contiguous_pairs
 
+    def compute_collision_ignore_pairs(
+        self,
+        prune_collision: bool = True,
+        n_samples: int = 100_000,
+        seed: int = 42,
+        custom_ignore: Optional[set[tuple[str, str]]] = None,
+    ) -> set[tuple[str, str]]:
+        """Compute canonical self-collision ignore pairs from exact meshes.
+
+        The result always combines direct URDF parent-child pairs,
+        caller-provided pairs, and non-adjacent pairs colliding at the joint
+        configuration active when this method is called. When pruning is
+        enabled, exact FCL checks over Halton samples additionally ignore
+        remaining pairs for which no mesh collision is observed.
+
+        Args:
+            prune_collision: Whether to enable Halton/FCL pruning after the
+                initial-configuration check.
+            n_samples: Number of Halton joint configurations when pruning is
+                enabled. The value is ignored when pruning is disabled.
+            seed: Scrambling seed for deterministic Halton samples.
+            custom_ignore: Optional caller-declared link pairs. Pair ordering
+                and duplicates are normalized before merging.
+
+        Returns:
+            Canonically ordered link pairs ignored by self-collision checks.
+
+        Raises:
+            ValueError: If pruning is enabled with an invalid sample count or
+                joint limits, or if collision geometry is invalid.
+            RuntimeError: If FK returns an incompatible transform shape.
+
+        Note:
+            FK temporarily mutates the underlying yourdfpy configuration. The
+            configuration is restored before returning or propagating an
+            exception. Halton pruning is finite-sample evidence rather than a
+            proof over the continuous joint space.
+        """
+        # Normalize policy inputs first so every downstream source shares one
+        # deterministic, undirected pair representation.
+        canonical_custom_pairs = {
+            canonicalize_link_pair(link_a, link_b)
+            for link_a, link_b in custom_ignore or set()
+        }
+        ignore_pairs = self._get_adjacent_links() | canonical_custom_pairs
+        collision_candidate_pairs = {
+            canonicalize_link_pair(link_a, link_b)
+            for link_a, link_b in self._non_contiguous_pairs
+        }.difference(ignore_pairs)
+        initial_configuration = np.asarray(self._urdf.cfg, dtype=np.float64).copy()
+        try:
+            # Match cuRobo's ordering: default-pose collisions become ignores
+            # before the optional workspace sampling stage is constructed.
+            initial_collision_pairs = compute_configuration_collision_pairs(
+                link_meshes=self._link_meshes,
+                candidate_pairs=collision_candidate_pairs,
+                joint_configuration=initial_configuration,
+                compute_transforms=self.compute_transforms,
+                all_link_names=self._all_link_names,
+            )
+            ignore_pairs.update(initial_collision_pairs)
+            if not prune_collision:
+                return ignore_pairs
+            if n_samples <= 0:
+                raise ValueError("n_samples must be positive")
+
+            # Initial collisions already have a decided policy, so excluding
+            # them avoids both redundant FCL work and contradictory evidence.
+            lower_limits, upper_limits = self.joint_limits
+            sampled_ignore_pairs = compute_halton_ignore_pairs(
+                link_meshes=self._link_meshes,
+                candidate_pairs=collision_candidate_pairs.difference(
+                    initial_collision_pairs
+                ),
+                joint_lower=lower_limits,
+                joint_upper=upper_limits,
+                compute_transforms=self.compute_transforms,
+                all_link_names=self._all_link_names,
+                n_samples=n_samples,
+                seed=seed,
+            )
+            ignore_pairs.update(sampled_ignore_pairs)
+            return ignore_pairs
+        finally:
+            # FK is stateful in yourdfpy; callers must observe the same robot
+            # configuration on success, early return, and failure paths.
+            self._urdf.update_cfg(initial_configuration)
+
     def get_mesh_distances(
         self, joint_cfg: np.ndarray | None = None
     ) -> dict[tuple[str, str], float]:
@@ -212,7 +308,7 @@ class Robot:
         """Build adjacency set from joint parent-child relationships."""
         adjacent = set()
         for joint in self._urdf.robot.joints:
-            pair = tuple(sorted([joint.parent, joint.child]))
+            pair = canonicalize_link_pair(joint.parent, joint.child)
             adjacent.add(pair)
         return adjacent
 
@@ -224,7 +320,7 @@ class Robot:
         pairs = []
         for i, link_a in enumerate(link_names):
             for link_b in link_names[i + 1 :]:
-                if tuple(sorted([link_a, link_b])) not in adjacent:
+                if canonicalize_link_pair(link_a, link_b) not in adjacent:
                     pairs.append((link_a, link_b))
         return pairs
 
@@ -451,52 +547,70 @@ class Robot:
         elif sync_similar:
             allocation = self._sync_similar_allocations(allocation)
 
-        return _compute_spheres_for_robot(
+        sphere_result = _compute_spheres_for_robot(
             self._link_meshes,
             self._links,
             link_budgets=allocation,
             similarity_result=self._similarity,
             spherize_params=cfg.spherize,
         )
+        return self._populate_sphere_metrics(sphere_result)
 
     def refine(
         self,
         spheres_result: RobotSpheresResult,
         config: BallparkConfig | None = None,
-        joint_cfg: np.ndarray | None = None,
-        excluded_pairs: set[tuple[str, str]] | None = None,
+        clip_links: Optional[Dict[str, Tuple[str, float]]] = None,
     ) -> RobotSpheresResult:
-        """
-        Refine sphere parameters using gradient-based optimization.
-
-        Jointly optimizes all spheres with:
-        - Per-link losses: coverage, volume, overlap, uniformity
-        - Robot-level losses: self-collision avoidance, similarity matching
+        """Refine every link independently against its collision mesh.
 
         Args:
-            spheres_result: Result from robot.spherize()
-            config: Configuration for refinement. If None, uses BALANCED preset.
-            joint_cfg: Joint configuration for FK and mesh distances. If None,
-                uses middle of joint limits with cached mesh distances.
-            excluded_pairs: Link pairs to skip for collision checking.
+            spheres_result: Link-local initial spheres from ``Robot.spherize``.
+            config: Optional fitting configuration; defaults to BALANCED.
+            clip_links: Per-link mesh-local clipping constraints. Each value is
+                an ``(axis, offset)`` pair, where axis is ``x``, ``y``, ``z``,
+                ``-x``, ``-y``, or ``-z`` and offset is measured in meters.
 
         Returns:
-            RobotSpheresResult with refined spheres
+            Refined spheres with fresh metrics computed against each original
+            collision mesh.
         """
         cfg = config or BallparkConfig.from_preset(SpherePreset.BALANCED)
 
         refined_link_spheres = refine_robot_spheres(
             spheres_result.link_spheres,
             self._link_meshes,
-            self._all_link_names,
-            self.joint_limits,
-            self.compute_transforms,
-            self._non_contiguous_pairs,
             refine_params=cfg.refine,
-            joint_cfg=joint_cfg,
-            excluded_pairs=excluded_pairs,
+            clip_links=clip_links,
         )
-        return RobotSpheresResult(link_spheres=refined_link_spheres)
+        return self._populate_sphere_metrics(
+            RobotSpheresResult(link_spheres=refined_link_spheres)
+        )
+
+    def _populate_sphere_metrics(
+        self,
+        spheres_result: RobotSpheresResult,
+    ) -> RobotSpheresResult:
+        """Compute per-link metrics against cached original collision meshes.
+
+        Args:
+            spheres_result: Sphere geometry keyed by link name.
+
+        Returns:
+            A new result containing the same sphere geometry and metrics for
+            every non-empty sphere-bearing link.
+        """
+        link_metrics = {
+            link_name: compute_sphere_fit_metrics(
+                self._link_meshes[link_name], spheres
+            )
+            for link_name, spheres in spheres_result.link_spheres.items()
+            if spheres and link_name in self._link_meshes
+        }
+        return RobotSpheresResult(
+            link_spheres=spheres_result.link_spheres,
+            link_metrics=link_metrics,
+        )
 
     def check_self_collision(
         self,

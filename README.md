@@ -6,12 +6,12 @@ Given a 3D mesh or a robot URDF, create a "ballpark" estimate of its spherical c
 
 Features include:
 - Fast mesh-to-sphere decomposition via recursive PCA-based splitting.
-- Sphere set optimization with volume-based losses, and more.
+- 使用与 cuRobo v2 MorphIt 对齐的覆盖、外凸、相切、重叠和可选半平面损失逐 link 细化球体。
 - Different presets for conservative, balanced, or surface-fitting sphere sets.
 
 For robot URDFs, we also include:
 - Automatic sphere distribution across robot links, proportional to their geometry complexity.
-- Spheres are optimized on a robot-level to have minimal self-collision distance at rest pose.
+- 每个 link 的球体独立细化，避免跨 link 的尺度耦合。
 - Similar links are detected and share sphere parameters for visual and geometric consistency.
 - JSON export with sphere parameters for each link, and an ignore-list of link pairs for collision checking.
 
@@ -62,7 +62,7 @@ urdf_coll = yourdfpy.URDF(
 robot = Robot(urdf_coll)
 result = robot.spherize(target_spheres=100)
 
-# Optional: refine with link- and robot-level costs
+# 可选：使用固定球数的 MorphIt 五项代价逐 link 细化
 config = BallparkConfig.from_preset(SpherePreset.BALANCED)
 result = robot.refine(result, config=config)
 
@@ -82,4 +82,3 @@ https://github.com/user-attachments/assets/895bbf5f-e4db-47c2-8946-cb5f2dbbb9b9
 This project builds on ideas from:
 - [foam](https://github.com/CoMMALab/foam)
 - [MorphIt](https://github.com/HIRO-group/MorphIt-1)
-

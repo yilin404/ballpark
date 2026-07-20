@@ -4,6 +4,7 @@ from ._config import BallparkConfig as BallparkConfig
 from ._config import RefineParams as RefineParams
 from ._config import SpherePreset as SpherePreset
 from ._config import SpherizeParams as SpherizeParams
+from ._metrics import SphereFitMetrics as SphereFitMetrics
 from ._robot import Robot as Robot
 from ._robot import RobotSpheresResult as RobotSpheresResult
 from ._spherize import Sphere as Sphere

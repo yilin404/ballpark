@@ -38,7 +38,15 @@ from ballpark import (
 def main(
     robot_name: Literal["ur5", "panda", "yumi", "g1", "iiwa14", "gen2"] = "panda",
 ) -> None:
-    """Visualize sphere decomposition on a robot with interactive controls."""
+    """Visualize sphere decomposition on a robot with interactive controls.
+
+    Args:
+        robot_name: Robot-description package prefix to load for visualization.
+
+    Note:
+        This function starts a Viser server and polls it until the process is
+        interrupted.
+    """
     print(f"Loading robot: {robot_name}...")
 
     # Load URDF with collision meshes for sphere computation
@@ -118,8 +126,6 @@ def main(
                 refined = robot.refine(
                     result,
                     config=config,
-                    joint_cfg=gui.joint_config,
-                    excluded_pairs=gui.excluded_collision_pairs,
                 )
                 elapsed = (time.perf_counter() - t0) * 1000
                 print(f"Refined spheres in {elapsed:.1f}ms")
@@ -155,7 +161,16 @@ def main(
 class _SpheresGui:
     """GUI controls for sphere visualization."""
 
-    def __init__(self, server: viser.ViserServer, robot: Robot):
+    def __init__(self, server: viser.ViserServer, robot: Robot) -> None:
+        """Initialize interactive controls for one robot.
+
+        Args:
+            server: Viser server that owns all GUI controls.
+            robot: Ballpark robot supplying links, limits, and sphere settings.
+
+        Note:
+            Initialization registers GUI controls and callbacks on ``server``.
+        """
         self._server = server
         self._robot = robot
         self._export_callback: Callable[[], None] | None = None
@@ -263,7 +278,11 @@ class _SpheresGui:
                 self._joint_sliders.append(slider)
 
     def poll(self) -> None:
-        """Check for GUI changes and update internal state."""
+        """Check for GUI changes and update pending recomputation flags.
+
+        Note:
+            This method mutates cached GUI state but does not run sphere fitting.
+        """
         # Preset change - affects both spherize and refine params
         if self._preset.value != self._last_preset:
             self._last_preset = self._preset.value
@@ -289,12 +308,8 @@ class _SpheresGui:
                 }
                 refine_params = {
                     "n_iters",
-                    "tol",
-                    "lambda_under",
-                    "lambda_over",
-                    "lambda_center_reg",
-                    "lambda_radius_reg",
-                    "lambda_self_collision",
+                    "lambda_coverage",
+                    "lambda_protrusion",
                 }
 
                 for key in current_params:
@@ -352,13 +367,13 @@ class _SpheresGui:
             self._last_opacity = self._opacity.value
             self._needs_visual_update = True
 
-        # Joint config change - triggers re-refine (mesh distances depend on config)
+        # Refinement is link-local, so joint changes only update visualization.
         current_joint_config = self.joint_config
         if self._last_joint_config is None or not np.allclose(
             current_joint_config, self._last_joint_config, atol=1e-4
         ):
             self._last_joint_config = current_joint_config.copy()
-            self._needs_refine_update = True
+            self._needs_visual_update = True
 
     def _get_group_for_link(self, link_name: str) -> list[str] | None:
         for group in self._robot._similarity.groups:
@@ -367,7 +382,12 @@ class _SpheresGui:
         return None
 
     def _create_params_folder(self) -> None:
-        """Create the Params folder with all sliders for Custom mode."""
+        """Create parameter controls used by the custom configuration mode.
+
+        Note:
+            The folder is created at most once and is attached to the existing
+            configuration folder.
+        """
         if self._params_folder is not None:
             return  # Already exists
         if self._config_folder is None:
@@ -449,52 +469,22 @@ class _SpheresGui:
                     step=10,
                     initial_value=cfg.refine.n_iters,
                 )
-                self._params_sliders["tol"] = self._server.gui.add_slider(
-                    "tol",
-                    min=1e-6,
-                    max=1e-2,
-                    step=1e-5,
-                    initial_value=cfg.refine.tol,
-                )
 
             # Loss weights (only those implemented in _refine.py)
             with self._server.gui.add_folder("Losses"):
-                self._params_sliders["lambda_under"] = self._server.gui.add_slider(
-                    "lambda_under",
+                self._params_sliders["lambda_coverage"] = self._server.gui.add_slider(
+                    "lambda_coverage",
                     min=0.0,
-                    max=5.0,
-                    step=0.001,
-                    initial_value=cfg.refine.lambda_under,
+                    max=5000.0,
+                    step=10.0,
+                    initial_value=cfg.refine.lambda_coverage,
                 )
-                self._params_sliders["lambda_over"] = self._server.gui.add_slider(
-                    "lambda_over",
+                self._params_sliders["lambda_protrusion"] = self._server.gui.add_slider(
+                    "lambda_protrusion",
                     min=0.0,
-                    max=0.1,
-                    step=0.001,
-                    initial_value=cfg.refine.lambda_over,
-                )
-                self._params_sliders["lambda_center_reg"] = self._server.gui.add_slider(
-                    "lambda_center_reg",
-                    min=0.0,
-                    max=10.0,
-                    step=0.001,
-                    initial_value=cfg.refine.lambda_center_reg,
-                )
-                self._params_sliders["lambda_radius_reg"] = self._server.gui.add_slider(
-                    "lambda_radius_reg",
-                    min=0.0,
-                    max=10.0,
-                    step=0.001,
-                    initial_value=cfg.refine.lambda_radius_reg,
-                )
-                self._params_sliders["lambda_self_collision"] = (
-                    self._server.gui.add_slider(
-                        "lambda_self_collision",
-                        min=0.0,
-                        max=10.0,
-                        step=0.001,
-                        initial_value=cfg.refine.lambda_self_collision,
-                    )
+                    max=1000.0,
+                    step=1.0,
+                    initial_value=cfg.refine.lambda_protrusion,
                 )
 
         # Cache initial values
@@ -530,32 +520,36 @@ class _SpheresGui:
             self._current_config = BallparkConfig.from_preset(preset_map[preset_name])
 
     def get_config(self) -> BallparkConfig:
-        """Get the current configuration (from preset or custom sliders)."""
+        """Build the configuration represented by the current GUI controls.
+
+        Returns:
+            Selected preset configuration or custom slider configuration.
+        """
         if self._preset.value != "Custom":
             return self._current_config
 
         # Build config from slider values
-        p = self._params_sliders
+        parameter_sliders = self._params_sliders
         return BallparkConfig(
             spherize=SpherizeParams(
-                padding=float(p["padding"].value),
-                target_tightness=float(p["target_tightness"].value),
-                aspect_threshold=float(p["aspect_threshold"].value),
-                percentile=float(p["percentile"].value),
-                max_radius_ratio=float(p["max_radius_ratio"].value),
-                uniform_radius=bool(p["uniform_radius"].value),
-                axis_mode=str(p["axis_mode"].value),
-                symmetry_mode=str(p["symmetry_mode"].value),
-                symmetry_tolerance=float(p["symmetry_tolerance"].value),
+                padding=float(parameter_sliders["padding"].value),
+                target_tightness=float(parameter_sliders["target_tightness"].value),
+                aspect_threshold=float(parameter_sliders["aspect_threshold"].value),
+                percentile=float(parameter_sliders["percentile"].value),
+                max_radius_ratio=float(parameter_sliders["max_radius_ratio"].value),
+                uniform_radius=bool(parameter_sliders["uniform_radius"].value),
+                axis_mode=str(parameter_sliders["axis_mode"].value),
+                symmetry_mode=str(parameter_sliders["symmetry_mode"].value),
+                symmetry_tolerance=float(
+                    parameter_sliders["symmetry_tolerance"].value
+                ),
             ),
             refine=RefineParams(
-                n_iters=int(p["n_iters"].value),
-                tol=float(p["tol"].value),
-                lambda_under=float(p["lambda_under"].value),
-                lambda_over=float(p["lambda_over"].value),
-                lambda_center_reg=float(p["lambda_center_reg"].value),
-                lambda_radius_reg=float(p["lambda_radius_reg"].value),
-                lambda_self_collision=float(p["lambda_self_collision"].value),
+                n_iters=int(parameter_sliders["n_iters"].value),
+                lambda_coverage=float(parameter_sliders["lambda_coverage"].value),
+                lambda_protrusion=float(
+                    parameter_sliders["lambda_protrusion"].value
+                ),
             ),
         )
 

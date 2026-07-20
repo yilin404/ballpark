@@ -70,14 +70,11 @@ class SpherizeParams:
 
 @jdc.pytree_dataclass
 class RefineParams:
-    """Parameters for jaxls nonlinear least squares refinement."""
+    """Parameters for independent per-link Warp/Torch refinement."""
 
     # Optimization params
     n_iters: int = 100
     """Maximum number of optimization iterations."""
-
-    tol: float = 1e-4
-    """Relative convergence tolerance for early stopping."""
 
     min_radius: float = 1e-4
     """Minimum allowed sphere radius."""
@@ -85,37 +82,35 @@ class RefineParams:
     n_samples: int = 5000
     """Points to sample per link for loss computation."""
 
-    # Per-link loss weights
-    lambda_under: float = 1.0
-    """Weight for under-approximation loss (points outside spheres)."""
+    n_sphere_surface_samples: int = 128
+    """Fixed surface directions sampled per optimized sphere."""
 
-    lambda_over: float = 0.01
-    """Weight for over-approximation loss (sphere volume)."""
+    center_lr: float = 0.005
+    """AdamW learning rate for link-normalized sphere centers."""
+
+    radius_lr: float = 0.001
+    """AdamW learning rate for unconstrained softplus radius parameters."""
+
+    grad_clip_norm: float = 1.0
+    """Independent gradient norm limit for center and radius tensors."""
+
+    lambda_coverage: float = 1000.0
+    """Weight for collision-mesh coverage loss."""
+
+    lambda_protrusion: float = 10.0
+    """Weight for positive mesh-SDF sphere-surface loss."""
+
+    lambda_tangency: float = 1.0
+    """Weight for sphere-to-mesh tangency loss."""
 
     lambda_overlap: float = 0.1
-    """Weight for intra-link sphere overlap penalty."""
+    """Weight for pairwise sphere overlap loss."""
 
-    lambda_uniform: float = 0.0
-    """Weight for radius uniformity within links."""
+    lambda_clip_plane: float = 1000.0
+    """Weight for per-link soft half-plane penetration."""
 
-    lambda_surface: float = 0.0
-    """Weight for surface matching loss."""
-
-    lambda_sqem: float = 0.0
-    """Weight for SQEM loss (signed error with normals)."""
-
-    # Robot-level loss weights
-    lambda_self_collision: float = 1.0
-    """Weight for inter-link self-collision penalty."""
-
-    lambda_center_reg: float = 0.1
-    """Weight for center drift regularization (penalizes deviation from initial positions)."""
-
-    lambda_radius_reg: float = 0.1
-    """Weight for radius regularization (penalizes deviation from initial radii)."""
-
-    lambda_similarity: float = 1.0
-    """Weight for similar link correspondence."""
+    clip_plane_buffer: float = 0.02
+    """Required sphere-to-clip-plane clearance in meters."""
 
 
 @jdc.pytree_dataclass
@@ -170,11 +165,9 @@ _PRESET_CONFIGS: dict[SpherePreset, BallparkConfig] = {
             uniform_radius=False,
         ),
         refine=RefineParams(
-            lambda_under=2.0,  # Prioritize coverage
-            lambda_over=0.02,  # Less volume penalty
-            lambda_overlap=0.05,  # Allow more overlap for tightness
-            lambda_uniform=0.0,
-            n_iters=150,  # More iterations for precision
+            lambda_coverage=1000.0,
+            lambda_protrusion=10.0,
+            n_iters=300,  # More iterations for precision
         ),
     ),
     SpherePreset.BALANCED: BallparkConfig(
@@ -187,11 +180,9 @@ _PRESET_CONFIGS: dict[SpherePreset, BallparkConfig] = {
             uniform_radius=False,
         ),
         refine=RefineParams(
-            lambda_under=1.0,
-            lambda_over=0.01,
-            lambda_overlap=0.1,
-            lambda_uniform=0.0,
-            n_iters=100,
+            lambda_coverage=1000.0,
+            lambda_protrusion=10.0,
+            n_iters=200,
         ),
     ),
     SpherePreset.CONSERVATIVE: BallparkConfig(
@@ -204,11 +195,9 @@ _PRESET_CONFIGS: dict[SpherePreset, BallparkConfig] = {
             uniform_radius=True,  # More uniform sizes
         ),
         refine=RefineParams(
-            lambda_under=0.5,  # Less strict on coverage
-            lambda_over=0.005,  # Allow larger volumes
-            lambda_overlap=0.2,  # Discourage overlap more
-            lambda_uniform=0.1,  # Encourage uniform radii
-            n_iters=80,  # Fewer iterations needed
+            lambda_coverage=1000.0,
+            lambda_protrusion=10.0,
+            n_iters=160,  # Fewer iterations needed
         ),
     ),
 }
